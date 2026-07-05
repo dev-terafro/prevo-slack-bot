@@ -180,11 +180,10 @@
     }
     var numDataRows = lastRow - 1;
     var bValues = rosterSheet.getRange(2, 2, numDataRows, 1).getValues();
-    // 「今回担当（先頭）」を最後尾へ回す：[a,b,c,d] → [b,c,d,a]
-    var first = bValues[0][0];
-    var newValues = [];
-    for (var i = 1; i < numDataRows; i++) newValues.push([bValues[i][0]]);
-    newValues.push([first]);
+    // 全員が1つ下の担当へ進み、最後尾（末尾）が先頭に戻る：[a,b,c,d] → [d,a,b,c]
+    var last = bValues[numDataRows - 1][0];
+    var newValues = [[last]];
+    for (var i = 0; i < numDataRows - 1; i++) newValues.push([bValues[i][0]]);
     rosterSheet.getRange(2, 2, numDataRows, 1).setValues(newValues);
   }
 
