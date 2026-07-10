@@ -17,9 +17,10 @@
   var COL_LAST_PERIOD    = 7;  // H
   var COL_LAST_RUN       = 8;  // I
   var COL_SKIP_OFFSET    = 9;  // J ← 新規追加
+  var COL_ROTATION_DIRECTION = 10; // K ← 新規追加（up/down、未設定はdown扱い）
 
-  /** _bots の読み込み列数（新J列を含めて10） */
-  var BOTS_NUM_COLS      = 10; // ← 新規（旧コードでは 9 だった箇所をこれに置換）
+  /** _bots の読み込み列数（新K列を含めて11） */
+  var BOTS_NUM_COLS      = 11; // ← 新規（旧コードでは 9 だった箇所をこれに置換）
 
   /** _state シートの列インデックス（0始まり） */
   var COL_STATE_SOURCE   = 0;
@@ -79,6 +80,7 @@
     var template    = String(row[COL_TEMPLATE]).trim();
     var lastRun     = String(row[COL_LAST_RUN]).trim();
     var skipOffset  = String(row[COL_SKIP_OFFSET]).trim();  // ← 新規
+    var direction   = String(row[COL_ROTATION_DIRECTION]).trim().toLowerCase() || 'down';  // ← 新規
 
     if (!botName) return;
 
@@ -127,7 +129,7 @@
 
       if (currentPeriod !== lastRotatedPeriod) {
         Logger.log('[ROTATE] ' + sourceSheet + ': ' + lastRotatedPeriod + ' → ' + currentPeriod);
-        rotateRoster_(rosterSheet);
+        rotateRoster_(rosterSheet, direction);
         updateStateSheet_(stateSheet, sourceSheet, currentPeriod);
         stateMap[sourceSheet] = currentPeriod;
       } else {
@@ -139,7 +141,7 @@
     // 開催日 = schedule の曜日 + skip_check_offset（投稿日と開催日がずれるBot向け。例：金曜投稿で翌土曜開催）
     var eventDowOffset = (typeof offsetDays === 'number' && !isNaN(offsetDays)) ? offsetDays : 0;
     var eventDow = ((DAY_MAP[schedDay] + eventDowOffset) % 7 + 7) % 7;
-    var scheduleInfo = { dayOfWeek: eventDow, intervalDays: rotUnit === 'week' ? 7 : null };
+    var scheduleInfo = { dayOfWeek: eventDow, intervalDays: rotUnit === 'week' ? 7 : null, direction: direction, skipDates: getSkipDatesSet_(ss) };
     var message = resolveTemplate_(template, now, rosterSheet, scheduleInfo);
 
     postToSlack_(channelId, message);
@@ -173,10 +175,33 @@
     return false;
   }
 
+  /**
+   * _skip シートの日付一覧を { 'yyyy-MM-dd': true, ... } の形で返す（{{schedule}} 用）
+   */
+  function getSkipDatesSet_(ss) {
+    var set = {};
+    var skipSheet = ss.getSheetByName('_skip');
+    if (!skipSheet) return set;
+    var lastRow = skipSheet.getLastRow();
+    if (lastRow < 2) return set;
+    var values = skipSheet.getRange(2, 1, lastRow - 1, 1).getValues();
+    for (var i = 0; i < values.length; i++) {
+      var v = values[i][0];
+      var s;
+      if (v instanceof Date) {
+        s = Utilities.formatDate(v, TZ, 'yyyy-MM-dd');
+      } else {
+        s = String(v).trim();
+      }
+      if (s) set[s] = true;
+    }
+    return set;
+  }
+
 
   // ===== ローテーション処理 =====
 
-  function rotateRoster_(rosterSheet) {
+  function rotateRoster_(rosterSheet, direction) {
     var lastRow = rosterSheet.getLastRow();
     if (lastRow < 3) {
       Logger.log('[WARN] ロスターのデータ行が少なすぎてローテ不可: ' + rosterSheet.getName());
@@ -184,10 +209,18 @@
     }
     var numDataRows = lastRow - 1;
     var bValues = rosterSheet.getRange(2, 2, numDataRows, 1).getValues();
-    // 全員が1つ下の担当へ進み、最後尾（末尾）が先頭に戻る：[a,b,c,d] → [d,a,b,c]
-    var last = bValues[numDataRows - 1][0];
-    var newValues = [[last]];
-    for (var i = 0; i < numDataRows - 1; i++) newValues.push([bValues[i][0]]);
+    var newValues;
+    if (direction === 'up') {
+      // 全員が1つ上の担当へ進み、先頭が末尾に回る：[a,b,c,d] → [b,c,d,a]
+      newValues = [];
+      for (var i = 1; i < numDataRows; i++) newValues.push([bValues[i][0]]);
+      newValues.push([bValues[0][0]]);
+    } else {
+      // 全員が1つ下の担当へ進み、最後尾（末尾）が先頭に戻る：[a,b,c,d] → [d,a,b,c]
+      var last = bValues[numDataRows - 1][0];
+      newValues = [[last]];
+      for (var i = 0; i < numDataRows - 1; i++) newValues.push([bValues[i][0]]);
+    }
     rosterSheet.getRange(2, 2, numDataRows, 1).setValues(newValues);
   }
 
@@ -272,15 +305,30 @@
         if (scheduleInfo && scheduleInfo.intervalDays && lastRow >= 2) {
           var numDataRows = lastRow - 1;
           var scheduleValues = rosterSheet.getRange(2, 2, numDataRows, 1).getValues();
-          var firstOccurrence = getUpcomingDate_(now, scheduleInfo.dayOfWeek);
+          var occDate = getUpcomingDate_(now, scheduleInfo.dayOfWeek);
+          var skipDates = scheduleInfo.skipDates || {};
           var scheduleLines = [];
-          for (var k = 0; k < numDataRows; k++) {
-            // 「下に進む」ローテーションでは、次に先頭へ来るのは現在の末尾側から順なので、
-            // 未来k回目の担当は現在の並びを末尾から遡ったインデックスになる
-            var idx = (numDataRows - k) % numDataRows;
-            var person = String(scheduleValues[idx][0]).trim();
-            var occDate = new Date(firstOccurrence.getTime() + k * scheduleInfo.intervalDays * 24 * 60 * 60 * 1000);
-            scheduleLines.push(Utilities.formatDate(occDate, TZ, 'M/d') + '：' + person);
+          var turnsShown = 0;
+          var safety = 0;
+          // _skip の日付は担当を進めず「お休み」として表示し、実際のローテーション挙動と一致させる
+          while (turnsShown < numDataRows && safety < numDataRows * 4) {
+            safety++;
+            var dateStr = Utilities.formatDate(occDate, TZ, 'yyyy-MM-dd');
+            var dateLabel = Utilities.formatDate(occDate, TZ, 'M/d');
+            if (skipDates[dateStr]) {
+              scheduleLines.push(dateLabel + '：（お休み）');
+            } else {
+              // ローテーション方向によって、未来turnsShown回目の担当インデックスの進み方が変わる
+              // up:   先頭が末尾に回るので、未来の担当は現在の並びを先頭から順に進んだインデックス
+              // down: 末尾が先頭に戻るので、未来の担当は現在の並びを末尾から遡ったインデックス
+              var idx = (scheduleInfo.direction === 'up')
+                ? (turnsShown % numDataRows)
+                : ((numDataRows - turnsShown) % numDataRows);
+              var person = String(scheduleValues[idx][0]).trim();
+              scheduleLines.push(dateLabel + '：' + person);
+              turnsShown++;
+            }
+            occDate = new Date(occDate.getTime() + scheduleInfo.intervalDays * 24 * 60 * 60 * 1000);
           }
           scheduleText = scheduleLines.join('\n');
         }
@@ -396,6 +444,7 @@
       var schedule    = String(row[COL_SCHEDULE]).trim();
       var template    = String(row[COL_TEMPLATE]).trim();
       var skipOffset  = String(row[COL_SKIP_OFFSET]).trim();
+      var direction   = String(row[COL_ROTATION_DIRECTION]).trim().toLowerCase() || 'down';
       if (!botName) continue;
       Logger.log('--- Bot: ' + botName + ' (enabled=' + enabled + ') ---');
       try {
@@ -408,7 +457,7 @@
         var parsedOffset = parseInt(skipOffset, 10);
         var eventDowOffset = isNaN(parsedOffset) ? 0 : parsedOffset;
         var scheduleInfo = (schedDay in DAY_MAP)
-          ? { dayOfWeek: ((DAY_MAP[schedDay] + eventDowOffset) % 7 + 7) % 7, intervalDays: rotUnit === 'week' ? 7 : null }
+          ? { dayOfWeek: ((DAY_MAP[schedDay] + eventDowOffset) % 7 + 7) % 7, intervalDays: rotUnit === 'week' ? 7 : null, direction: direction, skipDates: getSkipDatesSet_(ss) }
           : null;
         var message = resolveTemplate_(template, now, rosterSheet, scheduleInfo);
         Logger.log('  生成メッセージ:\n' + message);
@@ -446,6 +495,7 @@
       var template    = String(row[COL_TEMPLATE]).trim();
       var channelId   = String(row[COL_CHANNEL_ID]).trim();
       var skipOffset  = String(row[COL_SKIP_OFFSET]).trim();
+      var direction   = String(row[COL_ROTATION_DIRECTION]).trim().toLowerCase() || 'down';
 
       Logger.log('[TEST] Bot: ' + botNameToTest + ' を強制実行');
 
@@ -469,7 +519,7 @@
           var lastRotatedPeriod = stateMap[sourceSheet] || '';
           if (currentPeriod !== lastRotatedPeriod) {
             Logger.log('[ROTATE] ローテーション実行');
-            rotateRoster_(rosterSheet);
+            rotateRoster_(rosterSheet, direction);
             updateStateSheet_(stateSheet, sourceSheet, currentPeriod);
           }
         }
@@ -480,7 +530,7 @@
       var parsedOffset = parseInt(skipOffset, 10);
       var eventDowOffset = isNaN(parsedOffset) ? 0 : parsedOffset;
       var scheduleInfo = (schedDay in DAY_MAP)
-        ? { dayOfWeek: ((DAY_MAP[schedDay] + eventDowOffset) % 7 + 7) % 7, intervalDays: rotUnit === 'week' ? 7 : null }
+        ? { dayOfWeek: ((DAY_MAP[schedDay] + eventDowOffset) % 7 + 7) % 7, intervalDays: rotUnit === 'week' ? 7 : null, direction: direction, skipDates: getSkipDatesSet_(ss) }
         : null;
       var message = resolveTemplate_(template, now, roster, scheduleInfo);
       Logger.log('[MESSAGE]\n' + message);
